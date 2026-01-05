@@ -164,14 +164,15 @@ update_sshd_config() {
     local value="$2"
     local config_file="$3"
     
-    if $SUDO_CMD grep -q "^${key}" "$config_file"; then
-        $SUDO_CMD sed -i "s/^${key}.*/${key} ${value}/" "$config_file"
-    else
-        $SUDO_CMD sed -i "s/^#${key}.*/${key} ${value}/" "$config_file"
-        if ! $SUDO_CMD grep -q "^${key}" "$config_file"; then
-            echo "${key} ${value}" | $SUDO_CMD tee -a "$config_file" > /dev/null
-        fi
-    fi
+    # Escape special characters in key and value for sed
+    local escaped_key=$(printf '%s\n' "$key" | sed 's/[[\.*^$()+?{|]/\\&/g')
+    local escaped_value=$(printf '%s\n' "$value" | sed 's/[[\.*^$()+?{|]/\\&/g')
+    
+    # Remove all existing lines with this key (commented or not)
+    $SUDO_CMD sed -i "/^[[:space:]]*#*[[:space:]]*${escaped_key}[[:space:]]/d" "$config_file"
+    
+    # Add the new configuration at the end
+    echo "${key} ${value}" | $SUDO_CMD tee -a "$config_file" > /dev/null
 }
 
 configure_ssh() {
@@ -189,12 +190,68 @@ configure_ssh() {
     update_sshd_config "PermitRootLogin" "no" "$sshd_config"
     update_sshd_config "AllowUsers" "$USERNAME" "$sshd_config"
     
-    if $SUDO_CMD systemctl is-active --quiet ssh 2>/dev/null; then
-        $SUDO_CMD systemctl restart ssh
-    elif $SUDO_CMD systemctl is-active --quiet sshd 2>/dev/null; then
-        $SUDO_CMD systemctl restart sshd
+    log_info "Validating SSH configuration..."
+    local validation_output
+    validation_output=$(sshd -t -f "$sshd_config" 2>&1)
+    local validation_exit=$?
+    
+    if [[ $validation_exit -ne 0 ]]; then
+        log_error "SSH configuration validation failed!"
+        log_error "Validation error: $validation_output"
+        log_error "Restoring backup configuration..."
+        $SUDO_CMD cp "$sshd_config_backup" "$sshd_config"
+        exit 1
+    fi
+    log_info "SSH configuration is valid"
+    
+    log_info "Restarting SSH service..."
+    local ssh_service=""
+    
+    # Try to find SSH service - check both common names
+    for service_name in sshd ssh; do
+        if systemctl list-units --type=service --all 2>/dev/null | grep -qE "^${service_name}\.service" || \
+           systemctl is-enabled "$service_name" &>/dev/null || \
+           systemctl status "$service_name" &>/dev/null; then
+            ssh_service="$service_name"
+            break
+        fi
+    done
+    
+    if [[ -z "$ssh_service" ]]; then
+        log_error "SSH service (sshd or ssh) not found. Please restart manually."
+        exit 1
+    fi
+    
+    log_info "Found SSH service: $ssh_service"
+    
+    if systemctl is-active --quiet "$ssh_service" 2>/dev/null; then
+        log_info "Restarting $ssh_service..."
+        systemctl reload-or-restart "$ssh_service"
+        sleep 2
+        
+        if systemctl is-active --quiet "$ssh_service" 2>/dev/null; then
+            log_info "SSH service restarted successfully"
+            
+            if ss -tlnp 2>/dev/null | grep -q ":$SSH_PORT "; then
+                log_info "SSH is listening on port $SSH_PORT"
+            else
+                log_warn "SSH may not be listening on port $SSH_PORT yet. Please verify manually."
+            fi
+        else
+            log_error "SSH service failed to restart!"
+            log_error "Restoring backup configuration..."
+            $SUDO_CMD cp "$sshd_config_backup" "$sshd_config"
+            systemctl restart "$ssh_service" 2>/dev/null || true
+            exit 1
+        fi
     else
-        log_warn "SSH service not found. Please restart manually."
+        log_warn "SSH service is not active. Starting it..."
+        systemctl start "$ssh_service" 2>/dev/null || {
+            log_error "Failed to start SSH service"
+            exit 1
+        }
+        systemctl enable "$ssh_service" 2>/dev/null || true
+        log_info "SSH service started and enabled"
     fi
     
     log_info "SSH configured successfully on port $SSH_PORT"
@@ -237,6 +294,7 @@ configure_firewall() {
         DEBIAN_FRONTEND=noninteractive $SUDO_CMD apt install -y ufw
     fi
     
+    log_info "Disabling UFW temporarily to configure rules..."
     $SUDO_CMD ufw --force disable
     
     log_info "Removing old SSH port 22 rule if exists..."
@@ -249,8 +307,6 @@ configure_firewall() {
             $SUDO_CMD sed -i "s/^ports=.*/ports=$SSH_PORT\/tcp/" "$openssh_profile"
             $SUDO_CMD ufw app update OpenSSH
             log_info "OpenSSH profile updated to port $SSH_PORT"
-            $SUDO_CMD ufw disable
-            echo "y" | $SUDO_CMD ufw enable
         fi
         $SUDO_CMD ufw allow OpenSSH
     else
@@ -272,10 +328,15 @@ configure_firewall() {
         log_warn "Could not find ICMP sections in before.rules. Manual configuration may be needed."
     fi
     
-    $SUDO_CMD ufw disable
-    echo "y" | $SUDO_CMD ufw enable
+    log_info "Enabling UFW firewall..."
+    $SUDO_CMD ufw --force disable
+    echo "y" | $SUDO_CMD ufw --force enable
     
-    log_info "Firewall configured successfully"
+    if $SUDO_CMD ufw status | grep -q "Status: active"; then
+        log_info "Firewall configured and enabled successfully"
+    else
+        log_warn "Firewall may not be active. Please check manually."
+    fi
 }
 
 create_user() {
@@ -495,6 +556,10 @@ main() {
     
     check_root
     check_ubuntu
+    
+    # Initialize SUDO_CMD (empty since we're running as root)
+    SUDO_CMD=""
+    
     prompt_user_input
     update_system
     create_user
@@ -522,6 +587,12 @@ main() {
     log_warn "6. Test SSH connection before closing current session!"
     log_warn "7. User may need to log out/in for docker group permissions to take effect"
     echo ""
+    
+    log_info "Next steps:"
+    log_info "You can now run install_node.sh to install remnawave node and netbird"
+    log_info "Run: bash install_node.sh"
+    echo ""
+    
     log_info "Switching to user: $USERNAME"
     echo ""
     
