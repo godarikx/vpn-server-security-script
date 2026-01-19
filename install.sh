@@ -180,29 +180,93 @@ configure_ssh() {
     
     local sshd_config="/etc/ssh/sshd_config"
     local sshd_config_backup="${sshd_config}.backup.$(date +%Y%m%d_%H%M%S)"
+    local sshd_config_dir="/etc/ssh/sshd_config.d"
+    local hardening_config="${sshd_config_dir}/99-hardening.conf"
+    local hardening_config_backup="${hardening_config}.backup.$(date +%Y%m%d_%H%M%S)"
     
+    # Backup main config
     $SUDO_CMD cp "$sshd_config" "$sshd_config_backup"
     log_info "SSH config backed up to: $sshd_config_backup"
     
+    # Ensure sshd_config.d directory exists
+    $SUDO_CMD mkdir -p "$sshd_config_dir"
+    
+    # Backup hardening config if exists
+    if [[ -f "$hardening_config" ]]; then
+        $SUDO_CMD cp "$hardening_config" "$hardening_config_backup"
+        log_info "Hardening config backed up to: $hardening_config_backup"
+    fi
+    
+    # Update port in main config
     update_sshd_config "Port" "$SSH_PORT" "$sshd_config"
-    update_sshd_config "PasswordAuthentication" "no" "$sshd_config"
-    update_sshd_config "PubkeyAuthentication" "yes" "$sshd_config"
-    update_sshd_config "PermitRootLogin" "no" "$sshd_config"
+    
+    # Update AllowUsers in main config
     update_sshd_config "AllowUsers" "$USERNAME" "$sshd_config"
     
-    log_info "Validating SSH configuration..."
-    local validation_output
-    validation_output=$(sshd -t -f "$sshd_config" 2>&1)
-    local validation_exit=$?
+    # Create hardening config with highest priority (99)
+    log_info "Creating SSH hardening configuration (99-hardening.conf)..."
+    $SUDO_CMD tee "$hardening_config" > /dev/null <<EOF
+# SSH Hardening Configuration
+# Highest priority (99) - applied to all connections
+# Created: $(date)
+
+# Заблокировать пароль для всех пользователей
+Match all
+    PasswordAuthentication no
+    PubkeyAuthentication yes
+    ChallengeResponseAuthentication no
+    PermitRootLogin no
+    PermitEmptyPasswords no
+    UsePAM no
+EOF
     
-    if [[ $validation_exit -ne 0 ]]; then
-        log_error "SSH configuration validation failed!"
-        log_error "Validation error: $validation_output"
-        log_error "Restoring backup configuration..."
+    $SUDO_CMD chmod 644 "$hardening_config"
+    log_info "SSH hardening configuration created at: $hardening_config"
+    
+    log_info "Validating SSH configuration syntax..."
+    local syntax_check
+    syntax_check=$(sshd -t 2>&1)
+    local syntax_exit=$?
+    
+    if [[ $syntax_exit -ne 0 ]]; then
+        log_error "SSH configuration syntax validation failed!"
+        log_error "Syntax error: $syntax_check"
+        log_error "Restoring backup configurations..."
         $SUDO_CMD cp "$sshd_config_backup" "$sshd_config"
+        if [[ -f "$hardening_config_backup" ]]; then
+            $SUDO_CMD cp "$hardening_config_backup" "$hardening_config"
+        else
+            $SUDO_CMD rm -f "$hardening_config"
+        fi
         exit 1
     fi
-    log_info "SSH configuration is valid"
+    
+    log_info "SSH configuration syntax is valid"
+    
+    log_info "Verifying SSH security settings..."
+    local config_output
+    config_output=$(sshd -T 2>&1)
+    
+    # Verify password authentication is disabled
+    if echo "$config_output" | grep -qi "passwordauthentication yes"; then
+        log_warn "Password authentication may still be enabled. Please verify manually."
+    else
+        log_info "✓ Password authentication is disabled"
+    fi
+    
+    # Verify pubkey authentication is enabled
+    if echo "$config_output" | grep -qi "pubkeyauthentication yes"; then
+        log_info "✓ Pubkey authentication is enabled"
+    else
+        log_warn "Pubkey authentication may not be enabled. Please verify manually."
+    fi
+    
+    # Verify root login is disabled
+    if echo "$config_output" | grep -qi "permitrootlogin no"; then
+        log_info "✓ Root login is disabled"
+    else
+        log_warn "Root login may still be enabled. Please verify manually."
+    fi
     
     log_info "Restarting SSH service..."
     local ssh_service=""
@@ -396,15 +460,20 @@ EOF
 setup_ssh_keys() {
     log_info "Setting up SSH keys..."
     
+    # Setup root's authorized_keys
     local root_ssh_dir="/root/.ssh"
     local root_authorized_keys="${root_ssh_dir}/authorized_keys"
     
-    if [[ -f "$root_authorized_keys" ]]; then
-        log_info "Removing root's authorized_keys..."
-        rm -f "$root_authorized_keys"
-        log_info "Root's authorized_keys removed"
-    fi
+    log_info "Creating SSH directory for root..."
+    mkdir -p "$root_ssh_dir"
+    chmod 700 "$root_ssh_dir"
     
+    log_info "Adding SSH public key to root's authorized_keys..."
+    echo "$SSH_PUBLIC_KEY" > "$root_authorized_keys"
+    chmod 600 "$root_authorized_keys"
+    log_info "Root's SSH public key added successfully"
+    
+    # Setup user's authorized_keys
     local user_home=$(getent passwd "$USERNAME" | cut -d: -f6)
     local user_ssh_dir="${user_home}/.ssh"
     local user_authorized_keys="${user_ssh_dir}/authorized_keys"
@@ -418,9 +487,9 @@ setup_ssh_keys() {
     echo "$SSH_PUBLIC_KEY" > "$user_authorized_keys"
     chmod 600 "$user_authorized_keys"
     chown "$USERNAME:$USERNAME" "$user_authorized_keys"
-    log_info "SSH public key added successfully"
+    log_info "User's SSH public key added successfully"
     
-    log_info "SSH keys configured successfully"
+    log_info "SSH keys configured successfully for root and $USERNAME"
 }
 
 install_docker() {
